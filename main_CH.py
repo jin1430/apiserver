@@ -1,11 +1,11 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware # 👈 웹 접속 허용용
+from fastapi.middleware.cors import CORSMiddleware
 import cv2, numpy as np, os, uuid, io, math
 import uvicorn
 import requests
-import oracledb # 👈 DB 연결용 필수
+import oracledb
 
 from ultralytics import YOLO
 from PIL import Image
@@ -37,13 +37,11 @@ PRED_CLASSES = [0]
 PRED_AGNOSTIC_NMS = False
 
 # -------------------- DB 저장 함수 --------------------
-# 1. DB 저장 함수 수정
 def save_to_db(stop_id, level_str):
     try:
-        # 👇 oracledb로 변경 (makedsn 필요 없이 주소를 바로 넣으면 됩니다!)
-        # 형식: user/password@host:port/service_name
+        # DB 연결 (ID/PW 확인 필수)
         conn = oracledb.connect(
-            user="bus_admin",
+            user="bus_admin",   # ⚠️ 테이블을 만든 계정이 맞는지 확인하세요
             password="1234",
             dsn="0.tcp.jp.ngrok.io:17833/xe"
         )
@@ -57,34 +55,10 @@ def save_to_db(stop_id, level_str):
     except Exception as e:
         print(f"❌ Oracle DB 저장 실패: {e}")
     finally:
-        # 닫는 코드는 동일
         if 'cursor' in locals(): cursor.close()
         if 'conn' in locals(): conn.close()
 
-
-# 2. API 조회 함수 수정
-@app.get("/api/stops/{stop_id}")
-async def get_congestion(stop_id: str):
-    try:
-        # 👇 여기도 똑같이 수정
-        conn = oracledb.connect(
-            user="bus_admin",
-            password="1234",
-            dsn="0.tcp.jp.ngrok.io:17833/xe"
-        )
-        cursor = conn.cursor()
-
-        # ... (이후 쿼리 실행 코드는 cx_Oracle과 100% 동일하므로 건드릴 필요 없음) ...
-        sql = """
-            SELECT congestion_level 
-            FROM bus_congestion 
-            WHERE stop_id = :1 
-            ORDER BY created_at DESC 
-            FETCH FIRST 1 ROWS ONLY
-        """
-        cursor.execute(sql, [stop_id])
-
-# -------------------- utilities (기존과 동일) --------------------
+# -------------------- utilities --------------------
 def extract_person_boxes(results):
     boxes = []
     if results.boxes is None:
@@ -125,7 +99,7 @@ def visualize_dist(image, boxes):
                     0, 0.7, (255, 0, 0), 2)
     return out, d
 
-# -------------------- robust gap finder (기존과 동일) --------------------
+# -------------------- robust gap finder --------------------
 def trimmed_median_threshold(dists, gap_multiplier=2.2, min_gap_px=60):
     if not dists:
         return 0.0
@@ -178,7 +152,7 @@ def draw_gap_image(img, gaps, thr_text=None):
         cv2.putText(out, thr_text, (10, h-10), 0, 0.8, (0, 255, 255), 2)
     return out
 
-# -------------------- final dedup nms (기존과 동일) --------------------
+# -------------------- final dedup nms --------------------
 def iou(a, b):
     xA = max(a["x1"], b["x1"])
     yA = max(a["y1"], b["y1"])
@@ -204,12 +178,11 @@ async def root():
     return {"message": "A: Crowd GAP Improved - POST /count"}
 
 # -------------------------------------------------------------
-# 2. 웹 대시보드용 조회 API (HTML이 여기로 요청함)
+# 2. 웹 대시보드용 조회 API
 # -------------------------------------------------------------
 @app.get("/api/stops/{stop_id}")
 async def get_congestion(stop_id: str):
     try:
-        # 👇 [수정 완료] cx_Oracle을 지우고 oracledb로 통일했습니다.
         conn = oracledb.connect(
             user="bus_admin",
             password="1234",
@@ -229,9 +202,8 @@ async def get_congestion(stop_id: str):
         row = cursor.fetchone()
 
         if row is None:
-            return {"crowd": 0} # 데이터 없음
+            return {"crowd": 0}
 
-        # DB 값(High/Normal/Low) -> 숫자(3/2/1) 변환
         level_str = row[0]
         crowd_score = 1
 
@@ -243,11 +215,14 @@ async def get_congestion(stop_id: str):
 
     except Exception as e:
         print(f"DB Error: {e}")
-        return {"crowd": 0} # 에러 시 기본값
+        return {"crowd": 0}
     finally:
         if 'cursor' in locals(): cursor.close()
         if 'conn' in locals(): conn.close()
 
+# -------------------------------------------------------------
+# 3. 데이터 수신 및 처리 API
+# -------------------------------------------------------------
 @app.post("/count")
 async def count(request: Request, file: UploadFile = File(...)):
     if not file.content_type or not file.content_type.startswith("image/"):
@@ -302,7 +277,6 @@ async def count(request: Request, file: UploadFile = File(...)):
     crowd_level = 1
     level_str = "Low"
 
-    # 기준 설정 (10명 이상 High, 5명 이상 Normal, 그 외 Low)
     if person_count >= 10:
         crowd_level = 3
         level_str = "High"
@@ -313,10 +287,10 @@ async def count(request: Request, file: UploadFile = File(...)):
         crowd_level = 1
         level_str = "Low"
 
-    # 1. Oracle DB에 저장 (추가된 기능)
+    # 1. Oracle DB에 저장
     save_to_db("baekseok", level_str)
 
-    # 2. Java 서버로 전송 (기존 기능 유지)
+    # 2. Java 서버로 전송
     try:
         java_url = "http://localhost:8080/api/stops/baekseok/crowd"
         payload = {"crowd": crowd_level}
