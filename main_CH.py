@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware # 👈 웹 접속 허용용
 import cv2, numpy as np, os, uuid, io, math
 import uvicorn
 import requests
-import cx_Oracle # 👈 DB 연결용 필수
+import oracledb # 👈 DB 연결용 필수
 
 from ultralytics import YOLO
 from PIL import Image
@@ -37,17 +37,19 @@ PRED_CLASSES = [0]
 PRED_AGNOSTIC_NMS = False
 
 # -------------------- DB 저장 함수 --------------------
+# 1. DB 저장 함수 수정
 def save_to_db(stop_id, level_str):
     try:
-        # 👇 [수정필요] 비밀번호를 꼭 입력하세요!
-        dsn = cx_Oracle.makedsn('0.tcp.jp.ngrok.io', 17833, 'xe')
-        conn = cx_Oracle.connect('bus_admin', '1234', dsn)
+        # 👇 oracledb로 변경 (makedsn 필요 없이 주소를 바로 넣으면 됩니다!)
+        # 형식: user/password@host:port/service_name
+        conn = oracledb.connect(
+            user="bus_admin",
+            password="1234",
+            dsn="0.tcp.jp.ngrok.io:17833/xe"
+        )
         cursor = conn.cursor()
 
-        # created_at이 테이블에 있다면 SYSDATE로 현재시간 입력
-        # 테이블 컬럼이 (stop_id, congestion_level)만 있다면 created_at 부분 삭제하세요.
         sql = "INSERT INTO bus_congestion (stop_id, congestion_level, created_at) VALUES (:1, :2, SYSDATE)"
-
         cursor.execute(sql, [stop_id, level_str])
         conn.commit()
         print(f"✅ Oracle DB 저장 성공: {stop_id}, {level_str}")
@@ -55,8 +57,32 @@ def save_to_db(stop_id, level_str):
     except Exception as e:
         print(f"❌ Oracle DB 저장 실패: {e}")
     finally:
+        # 닫는 코드는 동일
         if 'cursor' in locals(): cursor.close()
         if 'conn' in locals(): conn.close()
+
+
+# 2. API 조회 함수 수정
+@app.get("/api/stops/{stop_id}")
+async def get_congestion(stop_id: str):
+    try:
+        # 👇 여기도 똑같이 수정
+        conn = oracledb.connect(
+            user="bus_admin",
+            password="1234",
+            dsn="0.tcp.jp.ngrok.io:17833/xe"
+        )
+        cursor = conn.cursor()
+
+        # ... (이후 쿼리 실행 코드는 cx_Oracle과 100% 동일하므로 건드릴 필요 없음) ...
+        sql = """
+            SELECT congestion_level 
+            FROM bus_congestion 
+            WHERE stop_id = :1 
+            ORDER BY created_at DESC 
+            FETCH FIRST 1 ROWS ONLY
+        """
+        cursor.execute(sql, [stop_id])
 
 # -------------------- utilities (기존과 동일) --------------------
 def extract_person_boxes(results):
