@@ -1,0 +1,5 @@
+ssh -i "bus-key.pem" ubuntu@[서버의 퍼블릭 IP 주소]
+
+source yolo_env/bin/activate
+
+13.211.215.48

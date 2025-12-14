@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>정류장 실시간 혼잡도 대시보드</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            padding-top: 50px;
+            background-color: #f4f4f4;
+        }
+        .container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+            display: inline-block;
+        }
+        h1 {
+            color: #333;
+        }
+        #crowdStatus {
+            font-size: 2.5em;
+            font-weight: bold;
+            margin-top: 20px;
+            padding: 10px 20px;
+            border-radius: 8px;
+            color: white;
+            display: inline-block;
+        }
+        .status-low { background-color: #4CAF50; } /* 초록 */
+        .status-normal { background-color: #FFC107; } /* 노랑 */
+        .status-high { background-color: #F44336; } /* 빨강 */
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>🚍 백석대 정문 정류장 실시간 혼잡도</h1>
+    <p>현재 백석대 정문 정류장의 혼잡도는</p>
+    <div id="crowdStatus">데이터 로딩 중...</div>
+    <p style="margin-top: 30px; font-size: 0.8em; color: #666;">
+        마지막 업데이트: <span id="lastUpdated">--</span>
+    </p>
+</div>
+
+<script>
+    // --------------------------------------------------------------------------------
+    // ⚠️ AWS 서버 IP 주소를 확인하고 입력하세요! (13.211.215.48)
+    const API_SERVER_IP = "13.211.215.48";
+    const STOP_ID = "baekseok"; // 조회할 정류장 ID
+    const API_URL = `http://${API_SERVER_IP}:8080/api/stops/${STOP_ID}`;
+    // --------------------------------------------------------------------------------
+
+    function updateDashboard() {
+        fetch(API_URL)
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                return response.json();
+            })
+            .then(data => {
+                // 1. 혼잡도 레벨 (crowd) 값 가져오기
+                const crowdLevel = data.crowd;
+
+                // 2. 텍스트 및 스타일 설정
+                let statusText = "";
+                let statusClass = "";
+
+                if (crowdLevel === 1) {
+                    statusText = "여유";
+                    statusClass = "status-low";
+                } else if (crowdLevel === 2) {
+                    statusText = "보통";
+                    statusClass = "status-normal";
+                } else if (crowdLevel >= 3) {
+                    statusText = "혼잡";
+                    statusClass = "status-high";
+                } else {
+                    statusText = "알 수 없음";
+                    statusClass = "status-low";
+                }
+
+                // 3. HTML 업데이트
+                const statusElement = document.getElementById('crowdStatus');
+                statusElement.textContent = statusText + " 입니다";
+                statusElement.className = ''; // 기존 클래스 제거
+                statusElement.classList.add(statusClass);
+
+                // 4. 마지막 업데이트 시간 표시
+                const now = new Date();
+                document.getElementById('lastUpdated').textContent = now.toLocaleTimeString();
+
+            })
+            .catch(error => {
+                console.error("데이터를 가져오는 중 오류 발생:", error);
+                document.getElementById('crowdStatus').textContent = "연결 오류";
+                document.getElementById('crowdStatus').className = 'status-high';
+            });
+    }
+
+    // 페이지 로드 시 즉시 실행
+    updateDashboard();
+
+    // 3초마다 자동으로 업데이트
+    setInterval(updateDashboard, 3000);
+
+</script>
+</body>
+</html>`z
