@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import cv2, numpy as np, os, uuid, io, math
 import uvicorn
 import requests
-import oracledb
+# import oracledb  # 👈 1. 불필요한 DB 라이브러리 import 제거
 
 from ultralytics import YOLO
 from PIL import Image
@@ -37,26 +37,8 @@ PRED_CLASSES = [0]
 PRED_AGNOSTIC_NMS = False
 
 # -------------------- DB 저장 함수 --------------------
-def save_to_db(stop_id, level_str):
-    try:
-        # DB 연결 (ID/PW 확인 필수)
-        conn = oracledb.connect(
-            user="BUS_USER",   # ⚠️ 테이블을 만든 계정이 맞는지 확인하세요
-            password="bus12345",
-            dsn="localhost:1521/XEPDB1"
-        )
-        cursor = conn.cursor()
-
-        sql = "INSERT INTO bus_congestion (stop_id, congestion_level, created_at) VALUES (:1, :2, SYSDATE)"
-        cursor.execute(sql, [stop_id, level_str])
-        conn.commit()
-        print(f"✅ Oracle DB 저장 성공: {stop_id}, {level_str}")
-
-    except Exception as e:
-        print(f"❌ Oracle DB 저장 실패: {e}")
-    finally:
-        if 'cursor' in locals(): cursor.close()
-        if 'conn' in locals(): conn.close()
+# 👈 2. save_to_db 함수 전체 제거 (Java 서버가 DB 저장을 담당합니다.)
+# --------------------------------------------------
 
 # -------------------- utilities --------------------
 def extract_person_boxes(results):
@@ -178,50 +160,29 @@ async def root():
     return {"message": "A: Crowd GAP Improved - POST /count"}
 
 # -------------------------------------------------------------
-# 2. 웹 대시보드용 조회 API
+# 3. 웹 대시보드용 조회 API (Java 서버로 프록시)
 # -------------------------------------------------------------
 @app.get("/api/stops/{stop_id}")
 async def get_congestion(stop_id: str):
+    # 👈 3. DB 직접 접속 대신 Java 서버의 조회 API를 호출하도록 수정
+    java_url = f"http://localhost:8080/api/stops/{stop_id}"
     try:
-        conn = oracledb.connect(
-            user="BUS_USER",
-            password="bus12345",
-            dsn="localhost:1521/XEPDB1"
-        )
-        cursor = conn.cursor()
+        response = requests.get(java_url, timeout=2)
+        response.raise_for_status() # HTTP 오류가 발생하면 예외 발생
 
-        # 가장 최근 데이터 1개 조회
-        sql = """
-            SELECT congestion_level 
-            FROM bus_congestion 
-            WHERE stop_id = :1 
-            ORDER BY created_at DESC 
-            FETCH FIRST 1 ROWS ONLY
-        """
-        cursor.execute(sql, [stop_id])
-        row = cursor.fetchone()
+        # Java 서버에서 받은 응답(Stop 엔티티)을 그대로 반환
+        return response.json()
 
-        if row is None:
-            return {"crowd": 0}
-
-        level_str = row[0]
-        crowd_score = 1
-
-        if level_str == 'High': crowd_score = 3
-        elif level_str == 'Normal': crowd_score = 2
-        elif level_str == 'Low': crowd_score = 1
-
-        return {"crowd": crowd_score}
-
-    except Exception as e:
-        print(f"DB Error: {e}")
-        return {"crowd": 0}
-    finally:
-        if 'cursor' in locals(): cursor.close()
-        if 'conn' in locals(): conn.close()
-
+    except requests.exceptions.Timeout:
+        print("DB Error: Java 서버 응답 시간 초과 (Timeout)")
+        # 실패 시, 기본값으로 처리하거나, 오류 응답을 반환
+        return {"crowd": 0, "stopId": stop_id}
+    except requests.exceptions.RequestException as e:
+        print(f"DB Error: Java 서버 통신 오류: {e}")
+        # 실패 시, 기본값으로 처리하거나, 오류 응답을 반환
+        return {"crowd": 0, "stopId": stop_id}
 # -------------------------------------------------------------
-# 3. 데이터 수신 및 처리 API
+# 4. 데이터 수신 및 처리 API
 # -------------------------------------------------------------
 @app.post("/count")
 async def count(request: Request, file: UploadFile = File(...)):
@@ -287,8 +248,8 @@ async def count(request: Request, file: UploadFile = File(...)):
         crowd_level = 1
         level_str = "Low"
 
-    # 1. Oracle DB에 저장
-    save_to_db("baekseok", level_str)
+    # 1. Oracle DB에 저장 (제거됨): Java 서버가 담당하므로 Python의 직접 저장 로직은 제거
+    # save_to_db("baekseok", level_str) # 👈 4. DB 직접 저장 로직 제거
 
     # 2. Java 서버로 전송
     try:
