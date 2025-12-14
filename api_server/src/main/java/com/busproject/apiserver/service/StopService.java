@@ -17,7 +17,9 @@ public class StopService {
         Stop stop = stopRepository.findById(stopId)
                 .orElseThrow(() -> new RuntimeException("정류장 없음: " + stopId));
         stop.setCrowd(crowdLevel);
-        // @Transactional 덕분에 save를 호출하지 않아도 자동으로 UPDATE 쿼리가 나갑니다.
+
+        // 🌟🌟🌟 이 한 줄이 핵심입니다. 명시적으로 DB에 저장 🌟🌟🌟
+        stopRepository.save(stop); // 👈 이 코드를 추가해 주세요!
     }
     // -----------------------------------------------------------
     // 💡 추가해야 할 메소드: DB에서 Stop 엔티티를 조회하여 반환
