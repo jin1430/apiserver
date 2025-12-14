@@ -42,7 +42,7 @@ def save_to_db(stop_id, level_str):
         # DB 연결 (ID/PW 확인 필수)
         conn = oracledb.connect(
             user="BUS_USER",   # ⚠️ 테이블을 만든 계정이 맞는지 확인하세요
-            password="1234",
+            password="BusPass1234!",
             dsn="localhost:1521/xe"
         )
         cursor = conn.cursor()
@@ -185,7 +185,7 @@ async def get_congestion(stop_id: str):
     try:
         conn = oracledb.connect(
             user="BUS_USER",
-            password="1234",
+            password="BusPass1234!",
             dsn="localhost:1521/xe"
         )
         cursor = conn.cursor()
