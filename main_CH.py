@@ -1,14 +1,27 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware # 👈 웹 접속 허용용
 import cv2, numpy as np, os, uuid, io, math
 import uvicorn
-import requests  # 👈 [수정 1] 이 줄을 꼭 추가해주세요!
+import requests
+import cx_Oracle # 👈 DB 연결용 필수
 
 from ultralytics import YOLO
 from PIL import Image
 
 app = FastAPI(title="People Counter (A: Crowd GAP Improved)")
+
+# -------------------------------------------------------------
+# 1. CORS 설정 (웹 대시보드 접속 허용)
+# -------------------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 OUTPUT_DIR = "outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -22,6 +35,28 @@ PRED_CONF = 0.15
 PRED_IOU = 0.60
 PRED_CLASSES = [0]
 PRED_AGNOSTIC_NMS = False
+
+# -------------------- DB 저장 함수 --------------------
+def save_to_db(stop_id, level_str):
+    try:
+        # 👇 [수정필요] 비밀번호를 꼭 입력하세요!
+        dsn = cx_Oracle.makedsn('0.tcp.jp.ngrok.io', 17833, 'xe')
+        conn = cx_Oracle.connect('bus_admin', '1234', dsn)
+        cursor = conn.cursor()
+
+        # created_at이 테이블에 있다면 SYSDATE로 현재시간 입력
+        # 테이블 컬럼이 (stop_id, congestion_level)만 있다면 created_at 부분 삭제하세요.
+        sql = "INSERT INTO bus_congestion (stop_id, congestion_level, created_at) VALUES (:1, :2, SYSDATE)"
+
+        cursor.execute(sql, [stop_id, level_str])
+        conn.commit()
+        print(f"✅ Oracle DB 저장 성공: {stop_id}, {level_str}")
+
+    except Exception as e:
+        print(f"❌ Oracle DB 저장 실패: {e}")
+    finally:
+        if 'cursor' in locals(): cursor.close()
+        if 'conn' in locals(): conn.close()
 
 # -------------------- utilities (기존과 동일) --------------------
 def extract_person_boxes(results):
@@ -142,6 +177,49 @@ def dedup_nms(boxes, iou_thr=0.70):
 async def root():
     return {"message": "A: Crowd GAP Improved - POST /count"}
 
+# -------------------------------------------------------------
+# 2. 웹 대시보드용 조회 API (HTML이 여기로 요청함)
+# -------------------------------------------------------------
+@app.get("/api/stops/{stop_id}")
+async def get_congestion(stop_id: str):
+    try:
+        # 👇 [수정필요] 비밀번호를 꼭 입력하세요!
+        dsn = cx_Oracle.makedsn('0.tcp.jp.ngrok.io', 17833, 'xe')
+        conn = cx_Oracle.connect('bus_admin', '1234', dsn)
+        cursor = conn.cursor()
+
+        # 가장 최근 데이터 1개 조회
+        sql = """
+            SELECT congestion_level 
+            FROM bus_congestion 
+            WHERE stop_id = :1 
+            ORDER BY created_at DESC 
+            FETCH FIRST 1 ROWS ONLY
+        """
+        cursor.execute(sql, [stop_id])
+        row = cursor.fetchone()
+
+        if row is None:
+            return {"crowd": 0} # 데이터 없음
+
+        # DB 값(High/Normal/Low) -> 숫자(3/2/1) 변환
+        level_str = row[0]
+        crowd_score = 1
+
+        if level_str == 'High': crowd_score = 3
+        elif level_str == 'Normal': crowd_score = 2
+        elif level_str == 'Low': crowd_score = 1
+
+        return {"crowd": crowd_score}
+
+    except Exception as e:
+        print(f"DB Error: {e}")
+        return {"crowd": 0} # 에러 시 기본값
+    finally:
+        if 'cursor' in locals(): cursor.close()
+        if 'conn' in locals(): conn.close()
+
+
 @app.post("/count")
 async def count(request: Request, file: UploadFile = File(...)):
     if not file.content_type or not file.content_type.startswith("image/"):
@@ -190,35 +268,36 @@ async def count(request: Request, file: UploadFile = File(...)):
     boxes = dedup_nms(boxes, iou_thr=0.70)
 
     # -------------------------------------------------------------
-    # 👇 [수정 2] 여기서부터 Java 서버로 보내는 코드가 추가되었습니다.
+    # 혼잡도 계산 및 저장
     # -------------------------------------------------------------
     person_count = len(boxes)
     crowd_level = 1
+    level_str = "Low"
 
-    # 기준 설정 (10명 이상 혼잡, 5명 이상 보통, 그 외 여유)
-    # ※ 이 기준 숫자는 원하시는 대로 바꾸시면 됩니다.
+    # 기준 설정 (10명 이상 High, 5명 이상 Normal, 그 외 Low)
     if person_count >= 10:
-        crowd_level = 3  # 혼잡 (빨강)
+        crowd_level = 3
+        level_str = "High"
     elif person_count >= 5:
-        crowd_level = 2  # 보통 (노랑)
+        crowd_level = 2
+        level_str = "Normal"
     else:
-        crowd_level = 1  # 여유 (초록)
+        crowd_level = 1
+        level_str = "Low"
 
+    # 1. Oracle DB에 저장 (추가된 기능)
+    save_to_db("baekseok", level_str)
+
+    # 2. Java 서버로 전송 (기존 기능 유지)
     try:
-        # 자바 서버 주소 (같은 EC2 안에 있으니 localhost 사용)
-        # stopId 부분(baekseok)은 필요에 따라 변경
         java_url = "http://localhost:8080/api/stops/baekseok/crowd"
         payload = {"crowd": crowd_level}
-
-        # 전송 (타임아웃 2초 설정으로 파이썬이 멈추는 것 방지)
         requests.post(java_url, json=payload, timeout=2)
         print(f"✅ Java 서버 전송 성공: 사람수={person_count}, 혼잡도={crowd_level}")
-
     except Exception as e:
         print(f"❌ Java 서버 전송 실패: {e}")
-    # -------------------------------------------------------------
 
-
+    # 이미지 저장 및 반환
     out = img.copy()
     for b in boxes:
         cv2.rectangle(out, (b["x1"], b["y1"]), (b["x2"], b["y2"]), (0, 255, 0), 2)
@@ -235,28 +314,6 @@ async def count(request: Request, file: UploadFile = File(...)):
         "debug_image_url": f"{base}/outputs/{dbg_name}",
         "gap_image_url": f"{base}/outputs/{gap_name}",
     })
-
-def save_to_db(data):
-    # 2. DB 연결 및 저장 함수 만들기 (또는 기존 코드 수정)
-    try:
-        # 여기에 아까 성공한 접속 정보를 넣습니다.
-        dsn = cx_Oracle.makedsn('0.tcp.jp.ngrok.io', 17833, 'xe')
-        conn = cx_Oracle.connect('system', '비밀번호', dsn)
-        cursor = conn.cursor()
-
-        # 예시: 데이터를 넣는 쿼리 (본인 테이블에 맞게 수정 필요)
-        sql = "INSERT INTO bus_congestion (stop_id, congestion_level) VALUES (:1, :2)"
-        cursor.execute(sql, data)
-
-        conn.commit() # 저장 확정
-        print("DB 저장 완료")
-
-    except Exception as e:
-        print("DB 에러:", e)
-    finally:
-        # 연결 종료 (중요)
-        if 'cursor' in locals(): cursor.close()
-        if 'conn' in locals(): conn.close()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
