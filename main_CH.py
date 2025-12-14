@@ -1,146 +1,219 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-import cv2
-import numpy as np
+import cv2, numpy as np, os, uuid, io, math
+import uvicorn
+
 from ultralytics import YOLO
 from PIL import Image
-import io
-import os
-import uuid
 
-app = FastAPI(title="People Counter API", description="API to count people in images")
+app = FastAPI(title="People Counter (A: Crowd GAP Improved)")
 
-# === CrowdHuman / 커스텀 데이터셋 설정 영역 ==========================
-# CrowdHuman을 YOLO 형식으로 변환해서 학습했다는 전제:
-#   예) 단일 클래스: ["person"]
-#   예) 다중 클래스: ["person_full", "person_visible", "head"]
-#
-# 실제 학습 시 사용한 클래스 이름과 동일하게 맞춰주세요.
-TARGET_CLASS_NAMES = {
-    "person",          # 단일 클래스인 경우
-    "person_full",     # 전체 인체
-    "person_visible",  # 보이는 부분
-    "head"             # 머리 박스
-}
-
-# 너무 낮은 confidence 박스는 무시
-MIN_CONFIDENCE = 0.3
-# ============================================================
-
-# 결과 이미지 저장 폴더
 OUTPUT_DIR = "outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# /outputs 경로로 정적 파일 제공 (이미지 다운로드/보기용)
 app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
 
-# YOLO 모델 (처음 1번만 로드)
-model = None
+# 모델 로드 (파일이 없으면 자동으로 다운로드 됩니다)
+model = YOLO("yolo11n.pt")
 
-def load_model():
-    """Load YOLO model for CrowdHuman-based person detection"""
-    global model
-    if model is None:
-        # CrowdHuman으로 학습한 커스텀 가중치
-        # (이미 Colab/서버에 best.pt를 업로드 했다고 가정)
-        model = YOLO("best.pt")
-    return model
+# 군중용 추론 파라미터
+PRED_CONF = 0.15
+PRED_IOU = 0.60
+PRED_CLASSES = [0]
+PRED_AGNOSTIC_NMS = False
+
+# -------------------- utilities --------------------
+def extract_person_boxes(results):
+    boxes = []
+    if results.boxes is None:
+        return boxes
+    for b in results.boxes:
+        if int(b.cls[0]) == 0:
+            x1, y1, x2, y2 = map(int, b.xyxy[0])
+            conf = float(b.conf[0]) if b.conf is not None else 0.0
+            boxes.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "conf": conf})
+    return boxes
+
+def sort_lr(boxes):
+    return sorted(boxes, key=lambda b: (b["x1"] + b["x2"]) / 2)
+
+def centers(boxes):
+    return [((b["x1"] + b["x2"]) // 2, (b["y1"] + b["y2"]) // 2) for b in boxes]
+
+def distances_2d(sorted_boxes):
+    c = centers(sorted_boxes)
+    d = []
+    for i in range(len(c) - 1):
+        dx = c[i+1][0] - c[i][0]
+        dy = c[i+1][1] - c[i][1]
+        d.append(float(math.sqrt(dx*dx + dy*dy)))
+    return c, d
+
+def visualize_dist(image, boxes):
+    out = image.copy()
+    s = sort_lr(boxes)
+    c, d = distances_2d(s)
+
+    for i, (x, y) in enumerate(c):
+        cv2.circle(out, (x, y), 4, (0, 0, 255), -1)
+        cv2.putText(out, str(i), (x + 6, y - 6), 0, 0.6, (0, 0, 255), 2)
+
+    for i, dist in enumerate(d):
+        (x1, y1), (x2, y2) = c[i], c[i+1]
+        cv2.line(out, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        cv2.putText(out, f"{int(dist)}px", ((x1 + x2)//2, (y1 + y2)//2),
+                    0, 0.7, (255, 0, 0), 2)
+    return out, d
+
+# -------------------- robust gap finder (crowd) --------------------
+def trimmed_median_threshold(dists, gap_multiplier=2.2, min_gap_px=60):
+    if not dists:
+        return 0.0
+    arr = np.array(dists, dtype=np.float32)
+    arr.sort()
+    n = len(arr)
+    if n >= 10:
+        trim = int(n * 0.15)
+        arr2 = arr[trim:n-trim] if (n - 2*trim) >= 3 else arr
+    else:
+        arr2 = arr
+    med = float(np.median(arr2))
+    thr = max(med * gap_multiplier, float(min_gap_px))
+    return thr
+
+def gap_regions_crowd(boxes, img_w,
+                      gap_multiplier=2.2, min_gap_px=60,
+                      min_region_w=80,
+                      margin_ratio=0.8, margin_px=120):
+    s = sort_lr(boxes)
+    c, d = distances_2d(s)
+    if not d:
+        return [], 0.0, d
+
+    thr = trimmed_median_threshold(d, gap_multiplier=gap_multiplier, min_gap_px=min_gap_px)
+
+    gaps = []
+    for i, dist in enumerate(d):
+        if dist > thr:
+            x_left = s[i]["x2"]
+            x_right = s[i+1]["x1"]
+            gap_w = max(0, x_right - x_left)
+            margin = int(gap_w * margin_ratio) + margin_px
+            x1 = max(0, x_left - margin)
+            x2 = min(img_w, x_right + margin)
+            if (x2 - x1) >= min_region_w:
+                gaps.append((x1, x2))
+
+    gaps.sort()
+    merged = []
+    for g in gaps:
+        if not merged or g[0] > merged[-1][1]:
+            merged.append(list(g))
+        else:
+            merged[-1][1] = max(merged[-1][1], g[1])
+    merged = [tuple(m) for m in merged]
+    return merged, thr, d
+
+def draw_gap_image(img, gaps, thr_text=None):
+    out = img.copy()
+    h, w = out.shape[:2]
+    for (x1, x2) in gaps:
+        cv2.rectangle(out, (x1, 0), (x2, h-1), (0, 255, 255), 2)
+        cv2.putText(out, f"GAP [{x1},{x2}]", (x1+5, 30),
+                    0, 0.7, (0, 255, 255), 2)
+    if thr_text is not None:
+        cv2.putText(out, thr_text, (10, h-10), 0, 0.8, (0, 255, 255), 2)
+    return out
+
+# -------------------- final dedup nms --------------------
+def iou(a, b):
+    xA = max(a["x1"], b["x1"])
+    yA = max(a["y1"], b["y1"])
+    xB = min(a["x2"], b["x2"])
+    yB = min(a["y2"], b["y2"])
+    inter = max(0, xB - xA) * max(0, yB - yA)
+    if inter <= 0:
+        return 0.0
+    areaA = max(1, (a["x2"] - a["x1"])) * max(1, (a["y2"] - a["y1"]))
+    areaB = max(1, (b["x2"] - b["x1"])) * max(1, (b["y2"] - b["y1"]))
+    return inter / (areaA + areaB - inter + 1e-9)
+
+def dedup_nms(boxes, iou_thr=0.70):
+    boxes = sorted(boxes, key=lambda b: b.get("conf", 0.0), reverse=True)
+    keep = []
+    for b in boxes:
+        if all(iou(b, k) < iou_thr for k in keep):
+            keep.append(b)
+    return keep
 
 @app.get("/")
 async def root():
-    return {"message": "People Counter API - Use POST /count to upload an image"}
+    return {"message": "A: Crowd GAP Improved - POST /count"}
 
 @app.post("/count")
-async def count_people(
-    request: Request,
-    file: UploadFile = File(...)
-):
-    """
-    이미지를 업로드 받아서:
-    - 사람 수를 세고
-    - 감지된 사람에 바운딩 박스를 그린 이미지를 저장한 뒤
-    - 그 이미지 URL을 반환
-    """
-    # 1. 파일 타입 검증
+async def count(request: Request, file: UploadFile = File(...)):
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
-    try:
-        # 2. 이미지 읽기
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents)).convert("RGB")  # RGB로 강제 변환
+    img = Image.open(io.BytesIO(await file.read())).convert("RGB")
+    img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-        # 3. PIL → numpy → BGR(OpenCV용)
-        image_array = np.array(image)
-        image_bgr = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
+    # 1차 탐지
+    r1 = model.predict(
+        img, conf=PRED_CONF, iou=PRED_IOU, classes=PRED_CLASSES, agnostic_nms=PRED_AGNOSTIC_NMS
+    )[0]
+    boxes = extract_person_boxes(r1)
 
-        # 4. YOLO 모델 로드 & 추론
-        yolo_model = load_model()
-        results = yolo_model(image_bgr)[0]  # 한 장이므로 [0] 사용
+    # 거리 디버그
+    debug_img, dists = visualize_dist(img, boxes)
+    dbg_name = f"debug_{uuid.uuid4().hex}.png"
+    cv2.imwrite(os.path.join(OUTPUT_DIR, dbg_name), debug_img)
 
-        # 모델에 저장된 클래스 이름 딕셔너리 가져오기
-        # 예: {0: 'person_full', 1: 'person_visible', 2: 'head'}
-        names = yolo_model.model.names if hasattr(yolo_model, "model") else yolo_model.names
+    # GAP 찾기
+    gaps, threshold, _ = gap_regions_crowd(
+        boxes, img_w=img.shape[1],
+        gap_multiplier=2.2, min_gap_px=60,
+        min_region_w=120, margin_ratio=0.8, margin_px=140
+    )
 
-        # 5. 사람 수 세기 및 바운딩 박스 그리기
-        person_count = 0
-        annotated_img = image_bgr.copy()
+    # GAP 시각화
+    gap_img = draw_gap_image(img, gaps, thr_text=f"thr={threshold:.1f}px")
+    gap_name = f"gap_{uuid.uuid4().hex}.png"
+    cv2.imwrite(os.path.join(OUTPUT_DIR, gap_name), gap_img)
 
-        boxes = results.boxes
-        if boxes is not None:
-            for box in boxes:
-                # confidence 필터
-                conf = float(box.conf[0]) if box.conf is not None else 1.0
-                if conf < MIN_CONFIDENCE:
-                    continue
+    # 2차 재탐지
+    for x1, x2 in gaps:
+        crop = img[:, x1:x2]
+        if crop.shape[1] < 40:
+            continue
+        r2 = model.predict(
+            crop, conf=PRED_CONF, iou=PRED_IOU, classes=PRED_CLASSES, agnostic_nms=PRED_AGNOSTIC_NMS
+        )[0]
+        for b in extract_person_boxes(r2):
+            b["x1"] += x1
+            b["x2"] += x1
+            boxes.append(b)
 
-                # 클래스 id → 클래스 이름
-                cls_id = int(box.cls[0])
-                cls_name = names.get(cls_id, str(cls_id)) if isinstance(names, dict) else str(names[cls_id])
+    # 최종 중복 제거
+    boxes = dedup_nms(boxes, iou_thr=0.70)
 
-                # CrowdHuman 커스텀 클래스 중 사람으로 취급할 클래스만 카운트
-                if cls_name not in TARGET_CLASS_NAMES:
-                    continue
+    out = img.copy()
+    for b in boxes:
+        cv2.rectangle(out, (b["x1"], b["y1"]), (b["x2"], b["y2"]), (0, 255, 0), 2)
 
-                person_count += 1
+    name = f"{uuid.uuid4().hex}.png"
+    cv2.imwrite(os.path.join(OUTPUT_DIR, name), out)
 
-                # 박스 좌표 (x1, y1, x2, y2)
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
+    base = str(request.base_url).rstrip("/")
+    return JSONResponse({
+        "count": len(boxes),
+        "predict": {"conf": PRED_CONF, "iou": PRED_IOU, "agnostic_nms": PRED_AGNOSTIC_NMS},
+        "gap_threshold_px": float(threshold),
+        "result_image_url": f"{base}/outputs/{name}",
+        "debug_image_url": f"{base}/outputs/{dbg_name}",
+        "gap_image_url": f"{base}/outputs/{gap_name}",
+    })
 
-                # 바운딩 박스 (초록색, 두께 2)
-                cv2.rectangle(annotated_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-                # 라벨 텍스트: 클래스 이름 + confidence (선택)
-                label = f"{cls_name} {conf:.2f}"
-                cv2.putText(
-                    annotated_img,
-                    label,
-                    (x1, max(y1 - 10, 0)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 0),
-                    2
-                )
-
-        # 6. 결과 이미지 저장
-        output_filename = f"{uuid.uuid4().hex}.png"
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
-
-        success = cv2.imwrite(output_path, annotated_img)
-        if not success:
-            raise HTTPException(status_code=500, detail="Failed to save result image")
-
-        # 7. 절대 URL 만들기 (예: https://xxxx.ngrok-free.app/outputs/xxxx.png)
-        base_url = str(request.base_url).rstrip("/")
-        result_image_url = f"{base_url}/outputs/{output_filename}"
-
-        # 8. JSON 응답
-        return JSONResponse(content={
-            "count": person_count,
-            "filename": file.filename,
-            "result_image_url": result_image_url
-        })
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
+if __name__ == "__main__":
+    # AWS 외부 접속을 위해 host는 0.0.0.0 으로 설정
+    uvicorn.run(app, host="0.0.0.0", port=8000)
