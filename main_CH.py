@@ -41,7 +41,7 @@ def save_to_db(stop_id, level_str):
     try:
         # DB 연결 (ID/PW 확인 필수)
         conn = oracledb.connect(
-            user="bus_admin",   # ⚠️ 테이블을 만든 계정이 맞는지 확인하세요
+            user="system",   # ⚠️ 테이블을 만든 계정이 맞는지 확인하세요
             password="1234",
             dsn="localhost:1521/xe"
         )
@@ -184,7 +184,7 @@ async def root():
 async def get_congestion(stop_id: str):
     try:
         conn = oracledb.connect(
-            user="bus_admin",
+            user="system",
             password="1234",
             dsn="localhost:1521/xe"
         )
