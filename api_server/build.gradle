@@ -17,13 +17,18 @@ java {
 repositories {
 	mavenCentral()
 }
-
 dependencies {
-	implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
-	implementation 'org.springframework.boot:spring-boot-starter-web'
-	runtimeOnly 'com.oracle.database.jdbc:ojdbc11'
-	testImplementation 'org.springframework.boot:spring-boot-starter-test'
-	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    // 1. 핵심 의존성은 유지
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+
+    // 2. 🔴 기존 Oracle 드라이버를 제거하고 MySQL 드라이버로 대체
+    // runtimeOnly 'com.oracle.database.jdbc:ojdbc11' 👈 이 줄을 제거/주석 처리
+    implementation 'mysql:mysql-connector-java:8.0.33' // 👈 MySQL JDBC Driver 추가 (최신 버전 사용)
+
+    // 3. 테스트 의존성은 유지
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
 tasks.named('test') {
