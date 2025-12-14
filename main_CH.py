@@ -209,9 +209,12 @@ async def root():
 @app.get("/api/stops/{stop_id}")
 async def get_congestion(stop_id: str):
     try:
-        # 👇 [수정필요] 비밀번호를 꼭 입력하세요!
-        dsn = cx_Oracle.makedsn('0.tcp.jp.ngrok.io', 17833, 'xe')
-        conn = cx_Oracle.connect('bus_admin', '1234', dsn)
+        # 👇 [수정 완료] cx_Oracle을 지우고 oracledb로 통일했습니다.
+        conn = oracledb.connect(
+            user="bus_admin",
+            password="1234",
+            dsn="0.tcp.jp.ngrok.io:17833/xe"
+        )
         cursor = conn.cursor()
 
         # 가장 최근 데이터 1개 조회
@@ -244,7 +247,6 @@ async def get_congestion(stop_id: str):
     finally:
         if 'cursor' in locals(): cursor.close()
         if 'conn' in locals(): conn.close()
-
 
 @app.post("/count")
 async def count(request: Request, file: UploadFile = File(...)):
